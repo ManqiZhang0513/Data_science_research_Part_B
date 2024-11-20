@@ -1,0 +1,845 @@
+---
+title: "Part B"
+author: "Manqi Zhang"
+date: "2024-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse, tidytext, tidymodels, plotly, patchwork, kernlab, gt, parsnip, ggplot2, skimr, dplyr, lubridate, data.table, tseries, forecast,tm,topicmodels)
+
+```
+
+```{r}
+category_by_month <- read.csv("category_by_month.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+
+# 创建第二张表中的映射关系
+cluster_info <- data.frame(
+  Category = c(
+    "DeviceProb", "Decentration/Incorrect size/Phakic Intraocular Lens Rotation",
+    "Pigment Dispersion/lens Deposits", "Discomfort", "Visual disturbances", "Glaucoma",
+    "Pain", "Pupil Ovalisation", "Intraocular Pressure(IOP) Elevation",
+    "Inflammation", "Edema", "Eye Injury", "RefractiveProb", "Cataract",
+    "Loss of Vision", "Bleeding", "Loss of Corneal Endothelial Cells"
+  ),
+  Cluster = c(4, 4, 2, 0, 1, 3, 2, 2, 0, 3, 2, 0, 2, 2, 1, 1, 1)
+)
+
+category_by_month <- category_by_month %>%
+  left_join(cluster_info, by = c("category" = "Category"))
+```
+
+```{r}
+# use function complete() to fill in missing dates frequency with 0
+category_by_month <- category_by_month %>%
+  mutate(Date = as.Date(Date))
+
+category_by_month_complete1 <- category_by_month %>%
+  select(-YEAR, -category) %>%                     
+  rename(frequency = Frequency) %>%               
+  group_by(Cluster) %>%
+  complete(Date = seq.Date(min(Date), max(Date), by = "month")) %>% 
+  fill(Cluster, .direction = "downup") %>%        
+  replace_na(list(frequency = 0)) %>%            
+  ungroup() %>%
+  group_by(Cluster, Date) %>%                    
+  summarise(frequency = sum(frequency, na.rm = TRUE)) %>% 
+  ungroup()
+head(category_by_month_complete1, n=20)
+```
+** Cluster0 model**
+```{r}
+category_by_month_complete1_cluster0 <- category_by_month_complete1 %>%
+  filter(Cluster == 0)
+
+set.seed(42)
+
+split_ratio <- 0.8 
+split_data <- category_by_month_complete1_cluster0 %>%
+  group_by(Cluster) %>%
+  mutate(
+    split_index = floor(n() * split_ratio),
+    train_flag = row_number() <= split_index 
+  ) %>%
+  ungroup()
+
+train_data <- split_data %>% filter(train_flag == TRUE)
+
+test_data <- split_data %>% filter(train_flag == FALSE)
+
+train_start_year <- year(min(train_data$Date))
+train_start_month <- month(min(train_data$Date))
+ts_train <- ts(train_data$frequency, start = c(train_start_year, train_start_month), frequency = 12)
+
+test_start_year <- year(min(test_data$Date))
+test_start_month <- month(min(test_data$Date) - 1)
+ts_test <- ts(test_data$frequency, start = c(test_start_year, test_start_month), frequency = 12)
+
+ts_data <- ts(train_data$frequency, 
+              start = c(year(min(train_data$Date)), month(min(train_data$Date))), 
+              frequency = 12)
+
+adf.test(ts_data)
+kpss.test(ts_data)
+
+ts_diff <- diff(ts_data, differences = 1)
+
+adf.test(ts_diff)
+kpss.test(ts_diff)
+
+stl_decomposed <- stl(ts_diff, s.window = "periodic")
+var(stl_decomposed$time.series[, "seasonal"]) / var(ts_data)
+
+```
+
+```{r}
+p_range <- 0:10
+d_range <- 0:1
+q_range <- 0:10
+P_range <- 0:10
+D_range <- 0:1
+Q_range <- 0:10
+
+max_iterations <- 30
+
+best_mape <- Inf
+best_rmse <- Inf
+best_model <- NULL
+best_predicted_original <- NULL
+best_forecasted <- NULL
+best_predicted_diff <- NULL
+
+set.seed(42)  
+for (i in 1:max_iterations) {
+  p <- sample(p_range, 1)
+  d <- sample(d_range, 1)
+  q <- sample(q_range, 1)
+  P <- sample(P_range, 1)
+  D <- sample(D_range, 1)
+  Q <- sample(Q_range, 1)
+  
+  fit <- tryCatch({
+    Arima(ts_diff, order = c(p, d, q), seasonal = c(P, D, Q))
+  }, error = function(e) NULL) 
+  
+  if (!is.null(fit)) {
+    forecasted <- forecast(fit, h = length(ts_test) + 3)
+    
+    last_actual_value <- tail(ts_data, 1)
+    predicted_diff <- forecasted$mean
+    predicted_original <- cumsum(c(last_actual_value, predicted_diff))[-1]
+    
+    actual <- test_data$frequency
+    
+    mape_value <- mape(actual, predicted_original[1:length(actual)])
+    rmse_value <- rmse(actual, predicted_original[1:length(actual)])
+    
+    if (rmse_value < best_rmse && mape_value < best_mape) {
+      best_mape <- mape_value
+      best_rmse <- rmse_value
+      best_model <- fit
+      best_forecasted <- forecasted
+      best_predicted_diff <- predicted_diff
+      best_predicted_original <- predicted_original
+    }
+  }
+}
+
+cat("MAPE on Test Set:", best_mape, "\n")
+cat("RMSE on Test Set:", best_rmse, "\n")
+summary(best_model)
+checkresiduals(best_model)
+
+
+```
+
+```{r}
+predicted_diff <- best_predicted_diff
+predicted_original <- best_predicted_original
+forecasted <- best_forecasted
+
+end_time <- end(ts_test)
+
+end_year <- end_time[1]
+end_month <- end_time[2]
+
+new_end_year <- end_year
+new_end_month <- end_month + 3
+
+if (new_end_month > 12) {
+  new_end_year <- new_end_year + 1
+  new_end_month <- new_end_month - 12
+}
+
+start_time <- start(ts_train)[1] + (start(ts_train)[2] - 1) / 12
+new_end_time <- new_end_year + (new_end_month - 1) / 12
+
+
+xlim_values <- c(start_time, new_end_time)
+
+end_train_year <- end(ts_train)[1]
+end_train_month <- end(ts_train)[2]
+
+
+end_train_time <- time(ts_train)[length(ts_train)] 
+
+
+end_train_value <- end_train_year + (end_train_month - 1) / 12
+
+
+test_time_values <- seq(from = end_train_value + 1/12, length.out = length(ts_test), by = 1/12)
+
+
+time_forecast <- seq(end_train_time + 1/12, by = 1/12, length.out = length(predicted_original))
+
+plot(ts_train, col = "black", main = paste("Forecast for Cluster", unique(category_by_month_complete1_cluster0$Cluster)),
+     ylab = "Frequency", xlab = "Time", xlim = c(start(ts_train)[1] + (start(ts_train)[2] - 1) / 12, tail(test_time_values, 1) + 2/12))
+
+
+lines(test_time_values, actual, col = "red", lwd = 2)
+
+lines(test_time_values, predicted_original[1:length(ts_test)], col = "blue", lwd = 2)
+
+
+future_times <- seq(tail(test_time_values, 1) + 1/12, length.out = 3, by = 1/12)
+lines(future_times, predicted_original[(length(ts_test) + 1):length(predicted_original)], col = "green", lwd = 2)
+
+
+legend("topleft", legend = c("Training (Black)", "Actual (Red)", "Predicted (Blue)","Further 3 months(Green)"),
+       col = c("black", "red", "blue","green"), lty = 1)
+```
+** Cluster1 model **
+```{r}
+category_by_month_complete1_cluster1 <- category_by_month_complete1 %>%
+  filter(Cluster == 1)
+
+set.seed(42)
+
+# 按 Cluster 和时间划分训练集和测试集
+split_ratio <- 0.8  # 80% 用作训练集
+split_data <- category_by_month_complete1_cluster1 %>%
+  group_by(Cluster) %>%
+  mutate(
+    split_index = floor(n() * split_ratio),
+    train_flag = row_number() <= split_index  # 标记训练集
+  ) %>%
+  ungroup()
+
+# 训练集
+train_data <- split_data %>% filter(train_flag == TRUE)
+
+# 测试集
+test_data <- split_data %>% filter(train_flag == FALSE)
+
+# 设置训练集时间序列
+train_start_year <- year(min(train_data$Date))
+train_start_month <- month(min(train_data$Date))
+ts_train <- ts(train_data$frequency, start = c(train_start_year, train_start_month), frequency = 12)
+
+# 获取测试集时间序列起始时间
+test_start_year <- year(min(test_data$Date))
+test_start_month <- month(min(test_data$Date) - 1)
+ts_test <- ts(test_data$frequency, start = c(test_start_year, test_start_month), frequency = 12)
+
+ts_data <- ts(train_data$frequency, 
+              start = c(year(min(train_data$Date)), month(min(train_data$Date))), 
+              frequency = 12)
+
+adf.test(ts_data)
+kpss.test(ts_data)
+
+ts_diff <- diff(ts_data, differences = 1)
+
+adf.test(ts_diff)
+kpss.test(ts_diff)
+
+stl_decomposed <- stl(ts_diff, s.window = "periodic")
+var(stl_decomposed$time.series[, "seasonal"]) / var(ts_data)
+
+```
+
+```{r}
+p_range <- 0:10
+d_range <- 0:1
+q_range <- 0:10
+P_range <- 0:10
+D_range <- 0:1
+Q_range <- 0:10
+
+max_iterations <- 30
+
+best_mape <- Inf
+best_rmse <- Inf
+best_model <- NULL
+best_predicted_original <- NULL
+best_forecasted <- NULL
+best_predicted_diff <- NULL
+
+set.seed(42)  
+for (i in 1:max_iterations) {
+  p <- sample(p_range, 1)
+  d <- sample(d_range, 1)
+  q <- sample(q_range, 1)
+  P <- sample(P_range, 1)
+  D <- sample(D_range, 1)
+  Q <- sample(Q_range, 1)
+  
+  fit <- tryCatch({
+    Arima(ts_diff, order = c(p, d, q), seasonal = c(P, D, Q))
+  }, error = function(e) NULL) 
+  
+  if (!is.null(fit)) {
+    forecasted <- forecast(fit, h = length(ts_test) + 3)
+    
+    last_actual_value <- tail(ts_data, 1)
+    predicted_diff <- forecasted$mean
+    predicted_original <- cumsum(c(last_actual_value, predicted_diff))[-1]
+    
+    actual <- test_data$frequency
+    
+    mape_value <- mape(actual, predicted_original[1:length(actual)])
+    rmse_value <- rmse(actual, predicted_original[1:length(actual)])
+    
+    if (rmse_value < best_rmse && mape_value < best_mape) {
+      best_mape <- mape_value
+      best_rmse <- rmse_value
+      best_model <- fit
+      best_forecasted <- forecasted
+      best_predicted_diff <- predicted_diff
+      best_predicted_original <- predicted_original
+    }
+  }
+}
+
+cat("MAPE on Test Set:", best_mape, "\n")
+cat("RMSE on Test Set:", best_rmse, "\n")
+summary(best_model)
+checkresiduals(best_model)
+
+
+```
+
+```{r}
+predicted_diff <- best_predicted_diff
+predicted_original <- best_predicted_original
+forecasted <- best_forecasted
+
+best_model %>% forecast(h=23) %>% autoplot()
+
+end_time <- end(ts_test)
+
+end_year <- end_time[1]
+end_month <- end_time[2]
+
+new_end_year <- end_year
+new_end_month <- end_month + 3
+
+if (new_end_month > 12) {
+  new_end_year <- new_end_year + 1
+  new_end_month <- new_end_month - 12
+}
+
+start_time <- start(ts_train)[1] + (start(ts_train)[2] - 1) / 12
+new_end_time <- new_end_year + (new_end_month - 1) / 12
+
+
+xlim_values <- c(start_time, new_end_time)
+
+end_train_year <- end(ts_train)[1]
+end_train_month <- end(ts_train)[2]
+
+
+end_train_time <- time(ts_train)[length(ts_train)] 
+
+
+end_train_value <- end_train_year + (end_train_month - 1) / 12
+
+
+test_time_values <- seq(from = end_train_value + 1/12, length.out = length(ts_test), by = 1/12)
+
+
+time_forecast <- seq(end_train_time + 1/12, by = 1/12, length.out = length(predicted_original))
+
+plot(ts_train, col = "black", main = paste("Forecast for Cluster", unique(category_by_month_complete1_cluster1$Cluster)),
+     ylab = "Frequency", xlab = "Time", xlim = c(start(ts_train)[1] + (start(ts_train)[2] - 1) / 12, tail(test_time_values, 1) + 2/12))
+
+
+lines(test_time_values, actual, col = "red", lwd = 2)
+
+lines(test_time_values, predicted_original[1:length(ts_test)], col = "blue", lwd = 2)
+
+
+future_times <- seq(tail(test_time_values, 1) + 1/12, length.out = 3, by = 1/12)
+lines(future_times, predicted_original[(length(ts_test) + 1):length(predicted_original)], col = "green", lwd = 2)
+
+
+legend("topleft", legend = c("Training (Black)", "Actual (Red)", "Predicted (Blue)","Further 3 months(Green)"),
+       col = c("black", "red", "blue","green"), lty = 1)
+```
+** Cluster2 model**
+```{r}
+category_by_month_complete1_cluster2 <- category_by_month_complete1 %>%
+  filter(Cluster == 2)
+
+set.seed(42)
+
+split_ratio <- 0.8  
+split_data <- category_by_month_complete1_cluster2 %>%
+  group_by(Cluster) %>%
+  mutate(
+    split_index = floor(n() * split_ratio),
+    train_flag = row_number() <= split_index  
+  ) %>%
+  ungroup()
+
+train_data <- split_data %>% filter(train_flag == TRUE)
+
+test_data <- split_data %>% filter(train_flag == FALSE)
+
+train_start_year <- year(min(train_data$Date))
+train_start_month <- month(min(train_data$Date))
+ts_train <- ts(train_data$frequency, start = c(train_start_year, train_start_month), frequency = 12)
+
+test_start_year <- year(min(test_data$Date))
+test_start_month <- month(min(test_data$Date) - 1)
+ts_test <- ts(test_data$frequency, start = c(test_start_year, test_start_month), frequency = 12)
+
+ts_data <- ts(train_data$frequency, 
+              start = c(year(min(train_data$Date)), month(min(train_data$Date))), 
+              frequency = 12)
+
+adf.test(ts_data)
+kpss.test(ts_data)
+plot(ts_data, main = "Original Time Series", ylab = "Frequency", xlab = "Time")
+
+ts_diff_ <- diff(ts_data, differences = 1)
+ts_diff %>% ggtsdisplay()
+
+adf.test(ts_diff)
+kpss.test(ts_diff)
+
+stl_decomposed <- stl(ts_diff, s.window = "periodic")
+var(stl_decomposed$time.series[, "seasonal"]) / var(ts_data)
+
+
+```
+
+```{r}
+p_range <- 0:10
+d_range <- 0:1
+q_range <- 0:10
+
+max_iterations <- 30
+
+best_mape <- Inf
+best_rmse <- Inf
+best_model <- NULL
+best_predicted_original <- NULL
+best_forecasted <- NULL
+best_predicted_diff <- NULL
+
+set.seed(42) 
+for (i in 1:max_iterations) {
+  p <- sample(p_range, 1)
+  d <- sample(d_range, 1)
+  q <- sample(q_range, 1)
+  
+  fit <- tryCatch({
+    Arima(ts_diff, order = c(p, d, q))
+  }, error = function(e) NULL) 
+  
+  if (!is.null(fit)) {
+    forecasted <- forecast(fit, h = length(ts_test) + 3)
+    
+    last_actual_value <- tail(ts_data, 1)
+    predicted_diff <- forecasted$mean
+    predicted_original <- cumsum(c(last_actual_value, predicted_diff))[-1]
+    
+    actual <- test_data$frequency
+    
+    mape_value <- mape(actual, predicted_original[1:length(actual)])
+    rmse_value <- rmse(actual, predicted_original[1:length(actual)])
+    
+    if (rmse_value < best_rmse && mape_value < best_mape) {
+      best_mape <- mape_value
+      best_rmse <- rmse_value
+      best_model <- fit
+      best_forecasted <- forecasted
+      best_predicted_diff <- predicted_diff
+      best_predicted_original <- predicted_original
+    }
+  }
+}
+
+cat("MAPE on Test Set:", best_mape, "\n")
+cat("RMSE on Test Set:", best_rmse, "\n")
+summary(best_model)
+checkresiduals(best_model)
+```
+
+```{r}
+
+predicted_diff <- best_predicted_diff
+predicted_original <- best_predicted_original
+forecasted <- best_forecasted
+
+end_time <- end(ts_test)
+
+end_year <- end_time[1]
+end_month <- end_time[2]
+
+new_end_year <- end_year
+new_end_month <- end_month + 3
+
+if (new_end_month > 12) {
+  new_end_year <- new_end_year + 1
+  new_end_month <- new_end_month - 12
+}
+
+start_time <- start(ts_train)[1] + (start(ts_train)[2] - 1) / 12
+new_end_time <- new_end_year + (new_end_month - 1) / 12
+
+xlim_values <- c(start_time, new_end_time)
+
+end_train_year <- end(ts_train)[1]
+end_train_month <- end(ts_train)[2]
+
+end_train_value <- end_train_year + (end_train_month - 1) / 12
+
+test_time_values <- seq(from = end_train_value + 1/12, length.out = length(ts_test), by = 1/12)
+
+last_actual_value <- tail(ts_data, 1)
+
+time_forecast <- seq(end_train_time + 1/12, by = 1/12, length.out = length(predicted_original))
+plot(ts_train, col = "black", main = paste("Forecast for Cluster", unique(category_by_month_complete1_cluster2$Cluster)),
+     ylab = "Frequency", xlab = "Time", xlim = c(start(ts_train)[1] + (start(ts_train)[2] - 1) / 12, tail(test_time_values, 1) + 2/12))
+
+lines(test_time_values, actual, col = "red", lwd = 2)
+
+lines(test_time_values, predicted_original[1:length(ts_test)], col = "blue", lwd = 2)
+
+future_times <- seq(tail(test_time_values, 1) + 1/12, length.out = 3, by = 1/12)
+lines(future_times, predicted_original[(length(ts_test) + 1):length(predicted_original)], col = "green", lwd = 2)
+
+legend("topleft", legend = c("Training (Black)", "Actual (Red)", "Predicted (Blue)","Further 3 months(Green)"),
+       col = c("black", "red", "blue","green"), lty = 1)
+
+```
+
+
+** Cluster3 model **
+```{r}
+category_by_month_complete1_cluster3 <- category_by_month_complete1 %>%
+  filter(Cluster == 3)
+
+set.seed(42)
+
+split_ratio <- 0.8 
+split_data <- category_by_month_complete1_cluster3 %>%
+  group_by(Cluster) %>%
+  mutate(
+    split_index = floor(n() * split_ratio),
+    train_flag = row_number() <= split_index 
+  ) %>%
+  ungroup()
+
+train_data <- split_data %>% filter(train_flag == TRUE)
+
+test_data <- split_data %>% filter(train_flag == FALSE)
+
+train_start_year <- year(min(train_data$Date))
+train_start_month <- month(min(train_data$Date))
+ts_train <- ts(train_data$frequency, start = c(train_start_year, train_start_month), frequency = 12)
+
+test_start_year <- year(min(test_data$Date))
+test_start_month <- month(min(test_data$Date) - 1)
+ts_test <- ts(test_data$frequency, start = c(test_start_year, test_start_month), frequency = 12)
+
+ts_data <- ts(train_data$frequency, 
+              start = c(year(min(train_data$Date)), month(min(train_data$Date))), 
+              frequency = 12)
+
+adf.test(ts_data)
+kpss.test(ts_data)
+
+ts_diff <- diff(ts_data, differences = 1)
+
+adf.test(ts_diff)
+kpss.test(ts_diff)
+
+stl_decomposed <- stl(ts_diff, s.window = "periodic")
+var(stl_decomposed$time.series[, "seasonal"]) / var(ts_data)
+
+```
+
+```{r}
+p_range <- 0:10
+d_range <- 0:1
+q_range <- 0:10
+P_range <- 0:10
+D_range <- 0:1
+Q_range <- 0:10
+
+max_iterations <- 30
+
+best_mape <- Inf
+best_rmse <- Inf
+best_model <- NULL
+best_predicted_original <- NULL
+best_forecasted <- NULL
+best_predicted_diff <- NULL
+
+set.seed(42)  
+for (i in 1:max_iterations) {
+  p <- sample(p_range, 1)
+  d <- sample(d_range, 1)
+  q <- sample(q_range, 1)
+  P <- sample(P_range, 1)
+  D <- sample(D_range, 1)
+  Q <- sample(Q_range, 1)
+  
+  fit <- tryCatch({
+    Arima(ts_diff, order = c(p, d, q), seasonal = c(P, D, Q))
+  }, error = function(e) NULL) 
+  
+  if (!is.null(fit)) {
+    forecasted <- forecast(fit, h = length(ts_test) + 3)
+    
+    last_actual_value <- tail(ts_data, 1)
+    predicted_diff <- forecasted$mean
+    predicted_original <- cumsum(c(last_actual_value, predicted_diff))[-1]
+    
+    actual <- test_data$frequency
+    
+    mape_value <- mape(actual, predicted_original[1:length(actual)])
+    rmse_value <- rmse(actual, predicted_original[1:length(actual)])
+    
+    if (rmse_value < best_rmse && mape_value < best_mape) {
+      best_mape <- mape_value
+      best_rmse <- rmse_value
+      best_model <- fit
+      best_forecasted <- forecasted
+      best_predicted_diff <- predicted_diff
+      best_predicted_original <- predicted_original
+    }
+  }
+}
+
+cat("MAPE on Test Set:", best_mape, "\n")
+cat("RMSE on Test Set:", best_rmse, "\n")
+summary(best_model)
+checkresiduals(best_model)
+
+
+```
+
+```{r}
+predicted_diff <- best_predicted_diff
+predicted_original <- best_predicted_original
+forecasted <- best_forecasted
+
+best_model %>% forecast(h=23) %>% autoplot()
+
+end_time <- end(ts_test)
+
+end_year <- end_time[1]
+end_month <- end_time[2]
+
+new_end_year <- end_year
+new_end_month <- end_month + 3
+
+if (new_end_month > 12) {
+  new_end_year <- new_end_year + 1
+  new_end_month <- new_end_month - 12
+}
+
+start_time <- start(ts_train)[1] + (start(ts_train)[2] - 1) / 12
+new_end_time <- new_end_year + (new_end_month - 1) / 12
+
+
+xlim_values <- c(start_time, new_end_time)
+
+end_train_year <- end(ts_train)[1]
+end_train_month <- end(ts_train)[2]
+
+
+end_train_time <- time(ts_train)[length(ts_train)] 
+
+
+end_train_value <- end_train_year + (end_train_month - 1) / 12
+
+
+test_time_values <- seq(from = end_train_value + 1/12, length.out = length(ts_test), by = 1/12)
+
+
+time_forecast <- seq(end_train_time + 1/12, by = 1/12, length.out = length(predicted_original))
+
+plot(ts_train, col = "black", main = paste("Forecast for Cluster", unique(category_by_month_complete1_cluster3$Cluster)),
+     ylab = "Frequency", xlab = "Time", xlim = c(start(ts_train)[1] + (start(ts_train)[2] - 1) / 12, tail(test_time_values, 1) + 2/12))
+
+
+lines(test_time_values, actual, col = "red", lwd = 2)
+
+lines(test_time_values, predicted_original[1:length(ts_test)], col = "blue", lwd = 2)
+
+
+future_times <- seq(tail(test_time_values, 1) + 1/12, length.out = 3, by = 1/12)
+lines(future_times, predicted_original[(length(ts_test) + 1):length(predicted_original)], col = "green", lwd = 2)
+
+
+legend("topleft", legend = c("Training (Black)", "Actual (Red)", "Predicted (Blue)","Further 3 months(Green)"),
+       col = c("black", "red", "blue","green"), lty = 1)
+```
+** Cluster4 model **
+```{r}
+category_by_month_complete1_cluster4 <- category_by_month_complete1 %>%
+  filter(Cluster == 4)
+
+set.seed(42)
+
+split_ratio <- 0.8  
+split_data <- category_by_month_complete1_cluster2 %>%
+  group_by(Cluster) %>%
+  mutate(
+    split_index = floor(n() * split_ratio),
+    train_flag = row_number() <= split_index  
+  ) %>%
+  ungroup()
+
+train_data <- split_data %>% filter(train_flag == TRUE)
+
+test_data <- split_data %>% filter(train_flag == FALSE)
+
+train_start_year <- year(min(train_data$Date))
+train_start_month <- month(min(train_data$Date))
+ts_train <- ts(train_data$frequency, start = c(train_start_year, train_start_month), frequency = 12)
+
+test_start_year <- year(min(test_data$Date))
+test_start_month <- month(min(test_data$Date) - 1)
+ts_test <- ts(test_data$frequency, start = c(test_start_year, test_start_month), frequency = 12)
+
+ts_data <- ts(train_data$frequency, 
+              start = c(year(min(train_data$Date)), month(min(train_data$Date))), 
+              frequency = 12)
+
+adf.test(ts_data)
+kpss.test(ts_data)
+plot(ts_data, main = "Original Time Series", ylab = "Frequency", xlab = "Time")
+
+ts_diff_ <- diff(ts_data, differences = 1)
+ts_diff %>% ggtsdisplay()
+
+adf.test(ts_diff)
+kpss.test(ts_diff)
+
+stl_decomposed <- stl(ts_diff, s.window = "periodic")
+var(stl_decomposed$time.series[, "seasonal"]) / var(ts_data)
+
+
+```
+
+```{r}
+p_range <- 0:6
+d_range <- 0:1
+q_range <- 0:6
+
+max_iterations <- 30
+
+best_mape <- Inf
+best_rmse <- Inf
+best_model <- NULL
+best_predicted_original <- NULL
+best_forecasted <- NULL
+best_predicted_diff <- NULL
+
+set.seed(42) 
+for (i in 1:max_iterations) {
+  p <- sample(p_range, 1)
+  d <- sample(d_range, 1)
+  q <- sample(q_range, 1)
+  
+  fit <- tryCatch({
+    Arima(ts_diff, order = c(p, d, q))
+  }, error = function(e) NULL) 
+  
+  if (!is.null(fit)) {
+    forecasted <- forecast(fit, h = length(ts_test) + 3)
+    
+    last_actual_value <- tail(ts_data, 1)
+    predicted_diff <- forecasted$mean
+    predicted_original <- cumsum(c(last_actual_value, predicted_diff))[-1]
+    
+    actual <- test_data$frequency
+    
+    mape_value <- mape(actual, predicted_original[1:length(actual)])
+    rmse_value <- rmse(actual, predicted_original[1:length(actual)])
+    
+    if (rmse_value < best_rmse && mape_value < best_mape) {
+      best_mape <- mape_value
+      best_rmse <- rmse_value
+      best_model <- fit
+      best_forecasted <- forecasted
+      best_predicted_diff <- predicted_diff
+      best_predicted_original <- predicted_original
+    }
+  }
+}
+
+cat("MAPE on Test Set:", best_mape, "\n")
+cat("RMSE on Test Set:", best_rmse, "\n")
+summary(best_model)
+checkresiduals(best_model)
+```
+
+```{r}
+
+predicted_diff <- best_predicted_diff
+predicted_original <- best_predicted_original
+forecasted <- best_forecasted
+
+end_time <- end(ts_test)
+
+end_year <- end_time[1]
+end_month <- end_time[2]
+
+new_end_year <- end_year
+new_end_month <- end_month + 3
+
+if (new_end_month > 12) {
+  new_end_year <- new_end_year + 1
+  new_end_month <- new_end_month - 12
+}
+
+start_time <- start(ts_train)[1] + (start(ts_train)[2] - 1) / 12
+new_end_time <- new_end_year + (new_end_month - 1) / 12
+
+xlim_values <- c(start_time, new_end_time)
+
+end_train_year <- end(ts_train)[1]
+end_train_month <- end(ts_train)[2]
+
+end_train_value <- end_train_year + (end_train_month - 1) / 12
+
+test_time_values <- seq(from = end_train_value + 1/12, length.out = length(ts_test), by = 1/12)
+
+last_actual_value <- tail(ts_data, 1)
+
+time_forecast <- seq(end_train_time + 1/12, by = 1/12, length.out = length(predicted_original))
+plot(ts_train, col = "black", main = paste("Forecast for Cluster", unique(category_by_month_complete1_cluster4$Cluster)),
+     ylab = "Frequency", xlab = "Time", xlim = c(start(ts_train)[1] + (start(ts_train)[2] - 1) / 12, tail(test_time_values, 1) + 2/12))
+
+lines(test_time_values, actual, col = "red", lwd = 2)
+
+lines(test_time_values, predicted_original[1:length(ts_test)], col = "blue", lwd = 2)
+
+future_times <- seq(tail(test_time_values, 1) + 1/12, length.out = 3, by = 1/12)
+lines(future_times, predicted_original[(length(ts_test) + 1):length(predicted_original)], col = "green", lwd = 2)
+
+legend("topleft", legend = c("Training (Black)", "Actual (Red)", "Predicted (Blue)","Further 3 months(Green)"),
+       col = c("black", "red", "blue","green"), lty = 1)
+
+```
+
